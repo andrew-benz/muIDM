@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 
 
 def DM(X, n_components=4, n_neighbors=5, rw_laziness=0.5):
-    K = graphtools.api.Graph(X).to_pygsp().W.tocsr()
+    K = graphtools.api.Graph(X, knn=n_neighbors).to_pygsp().W.tocsr()
+    K = 1/2 * (K + K.T)
 
     degrees = np.array(K.sum(axis=0))[0]
     
@@ -36,9 +37,81 @@ def DM(X, n_components=4, n_neighbors=5, rw_laziness=0.5):
 
     return dm_embedding
 
-def ONM(X, aff_matrix, S, S_complement, rw_laziness=0.75):
-    #K = sklearn.neighbors.kneighbors_graph(X, n_neighbors)
+def nystrom_DM(X, S, S_complement, n_neighbors=5, rw_laziness=0.5, t=5):
     K = graphtools.api.Graph(X, knn=n_neighbors).to_pygsp().W.tocsr()
+    K = 1/2 * (K + K.T)
+
+    degrees = np.array(K.sum(axis=0))[0]
+    
+    Q = scipy.sparse.diags(degrees)
+    Q_inv = scipy.sparse.diags(1/degrees)
+    Q_sqrt = scipy.sparse.diags(degrees**(1/2))
+    Q_inv_sqrt = scipy.sparse.diags(degrees**(-1/2))
+    print(Q_inv_sqrt)
+
+    P = Q_inv @ K
+    P = (1 - rw_laziness) * P + rw_laziness * scipy.sparse.eye(P.shape[0])
+    P = np.linalg.matrix_power(P.todense(), t)
+    A = Q_sqrt @ P @ Q_inv_sqrt
+    A_sub_ul = A[np.ix_(S, S)] # A upper-left submatrix
+    A_sub_ur = A[np.ix_(S, S_complement)]
+
+    A_sub_ul_eigvals, A_sub_ul_eigvecs = scipy.linalg.eigh(A_sub_ul, driver='ev')
+    A_sub_ul_eigvals = np.flip(A_sub_ul_eigvals)
+    A_sub_ul_eigvecs = np.flip(A_sub_ul_eigvecs, axis=1)
+    nystrom = A_sub_ur.T @ A_sub_ul_eigvecs @ np.diag(1 / A_sub_ul_eigvals)
+    approx_eigvecs = np.concatenate((A_sub_ul_eigvecs, nystrom), axis=0)
+    dm_embedding = Q_inv_sqrt @ approx_eigvecs @ np.diag(A_sub_ul_eigvals)
+
+    return dm_embedding
+
+def ONM(A, degrees, S, S_complement, rw_laziness=0.75):
+    Q_inv_sqrt = scipy.sparse.diags(degrees**(-1/2))
+
+    A_tilde = A[S]
+    A_sub_ul = A[np.ix_(S, S)] # A upper-left submatrix
+    A_sub_ur = A[np.ix_(S, S_complement)]
+
+    A_sub_ul_eigvals, A_sub_ul_eigvecs = scipy.linalg.eigh(A_sub_ul, driver='ev')
+    A_sub_ul_inv_sqrt = A_sub_ul_eigvecs @ np.diag(A_sub_ul_eigvals**(-1/2)) @ A_sub_ul_eigvecs.T
+
+    C = A_sub_ul + A_sub_ul_inv_sqrt @ A_sub_ur @ A_sub_ur.T @ A_sub_ul_inv_sqrt
+    C_u, C_s, _ = np.linalg.svd(C, hermitian=True)
+    Delta = scipy.sparse.diags(C_s)
+    onm_embedding = Q_inv_sqrt @ A_tilde.T @ A_sub_ul_inv_sqrt @ C_u @ np.sqrt(Delta)
+
+    return onm_embedding
+
+def compute_T(old_onm_embedding, new_onm_embedding, S):
+
+    return T 
+
+def muIDM(X, mu, n_neighbors=40, rw_laziness=0.5, t=5):
+    """
+    Parameters
+    ----------
+    X: {array-like} of shape (n_samples, n_features)
+        Data matrix.
+
+    mu: float
+        Distance error bound (using the l-inf norm) for approximation.
+
+    n_neighbors: int
+        Number of nearest neighbors for nearest neighbors graph building.
+
+    rw_laziness: float
+        Probability that a random walker remains at its current vertex in each time step.
+
+    t: int
+        Power that the diffusion operator is raised to.
+
+    Returns
+    ----------
+    Matrix of shape (n_samples, n_components) containing the approximate diffusion coordinates,
+    where n_components is determined by the algorithm given a value of mu.
+    """
+    
+    K = graphtools.api.Graph(X, decay=None, knn=n_neighbors).to_pygsp().W.tocsr()
     K = 1/2 * (K + K.T)
 
     degrees = np.array(K.sum(axis=0))[0] 
@@ -49,60 +122,41 @@ def ONM(X, aff_matrix, S, S_complement, rw_laziness=0.75):
 
     P = Q_inv @ K
     P = (1 - rw_laziness) * P + rw_laziness * scipy.sparse.eye(P.shape[0])
+    P = np.linalg.matrix_power(P.todense(), t)
     A = Q_sqrt @ P @ Q_inv_sqrt
 
-    A_tilde = A[S]
-    A_sub_ul = A[np.ix_(S, S)] # A upper-left submatrix
-    A_sub_ur = A[np.ix_(S, S_complement)]
+    S = [0]
+    S_complement = list(range(1, X.shape[0]))
+    onm_embedding = ONM(A, degrees, S, S_complement, rw_laziness)
+    change_of_basis = np.linalg.inv(onm_embedding[S]) 
 
-    A_sub_ul_eigvals, A_sub_ul_eigvecs = scipy.linalg.eigh(A_sub_ul.toarray(), driver='ev')
-    #A_sub_ul_eigvals = np.flip(A_sub_ul_eigvals)
-    #A_sub_ul_eigvecs = np.flip(A_sub_ul_eigvecs, axis=1)
-    A_sub_ul_inv_sqrt = A_sub_ul_eigvecs @ np.diag(A_sub_ul_eigvals**(-1/2)) @ A_sub_ul_eigvecs.T
+    i = 0
+    while i < len(S_complement):
+        k = S_complement[i]
+        new_onm_embedding = ONM(A,
+                                degrees,
+                                S + [k],
+                                S_complement[:i] + S_complement[i + 1:], 
+                                rw_laziness)
 
-    C = A_sub_ul + A_sub_ul_inv_sqrt @ A_sub_ur @ A_sub_ur.T @ A_sub_ul_inv_sqrt
-    C_u, C_s, _ = np.linalg.svd(C, hermitian=True)
-    Delta = scipy.sparse.diags(C_s)
-    onm_embedding = Q_inv_sqrt @ A_tilde.T @ A_sub_ul_inv_sqrt @ C_u @ np.sqrt(Delta)
-
-    return onm_embedding
-
-
-def muIDM(X, n_components=2, n_neighbors=40, rw_laziness=0.5, mu=1):
-    """
-    Parameters
-    ----------
-    X: {array-like} of shape (n_samples, n_features)
-        Data matrix.
-
-    n_components: int
-        The dimension of the projected subspace.
-
-    n_neighbors: int
-        Number of nearest neighbors for nearest neighbors graph building.
-
-    mu: float
-        Distance error bound for approximation.
-
-    gamma: float
-        Kernel coefficient for rbf kernel.
-
-    Returns
-    ----------
-    Matrix of shape (n_samples, n_components) containing the approximate diffusion coordinates.
-    """
-
-    pass
-
-n_samples = 3000
-n_neighbors = 70
-X, t = sklearn.datasets.make_swiss_roll(n_samples)
-K = graphtools.api.Graph(X, knn=n_neighbors).to_pygsp().W.tocsr()
-
-dict_size = int(4/5 * n_samples)
-K = 1/2 * (K + K.T)
-onm = ONM(X, K, list(range(dict_size)), list(range(dict_size, n_samples)))
-
-scprep.plot.scatter3d(onm[:,1:4], t)
-plt.show()
+        T = change_of_basis @ new_onm_embedding[S]
+        beta = np.max(np.abs(new_onm_embedding[k] - (onm_embedding[k] @ T)))
+        if beta > mu / 2:
+            onm_embedding = new_onm_embedding
+            S.append(k)
+            S_complement = S_complement[:i] + S_complement[i + 1:]
+            change_of_basis = np.linalg.inv(onm_embedding[S]) 
+        else:
+            i += 1
     
+    return onm_embedding
+   
+def test_muIDM_on_swiss_roll(n_samples, mu):
+    X, t = sklearn.datasets.make_swiss_roll(n_samples)
+    onm = muIDM(X, n_neighbors=int(n_samples/2), rw_laziness=0.75, mu=mu)
+    scprep.plot.scatter3d(X, c=onm[:,1])
+    plt.show() 
+
+if __name__=='__main__':
+    test_muIDM_on_swiss_roll(500, 0.01)
+
